@@ -38,8 +38,8 @@ func Unzip(files []string, outdir string, verbose bool) {
 					continue
 				}
 
-				// Create Destination File
-				w, err := os.Create(work.outpath)
+				// Create Destination File with temporary permissions
+				w, err := os.OpenFile(work.outpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 				if err != nil {
 					rc.Close()
 					println("Can't open a file to write:", err)
@@ -47,37 +47,61 @@ func Unzip(files []string, outdir string, verbose bool) {
 				}
 
 				// Extract the File
-				io.Copy(w, rc)
+				_, err = io.Copy(w, rc)
 
-				// Clean up
+				// Close handles before changing permissions
 				rc.Close()
 				w.Close()
+
+				if err != nil {
+					println("Error copying file:", err)
+					continue
+				}
+
+				// Get original permissions from zip
+				mode := work.file.Mode()
+
+				// If the file is marked as executable in the zip, ensure execute bits are set
+				if mode&0100 != 0 { // User executable
+					mode |= 0111 // Add execute bits for all
+				}
+
+				// Apply the permissions
+				if err := os.Chmod(work.outpath, mode); err != nil {
+					println("Error setting file permissions:", err)
+				}
 			}
 		}()
 	}
 
-	// Process each zip file
 	for _, file := range files {
-		// Open Reader
 		r, err := zip.OpenReader(file)
 		if err != nil {
 			println("Can't open zip file:", err)
 			continue
 		}
 
-		// Queue work for all files
 		for _, f := range r.File {
 			if f.Mode().IsDir() {
+				name := f.FileHeader.Name
+				outpath := path.Join(outdir, name)
+				if err := os.MkdirAll(outpath, f.Mode()); err != nil {
+					println("Error creating directory:", err)
+				}
 				continue
-			}
+			} else {
+				name := f.FileHeader.Name
+				outpath := path.Join(outdir, name)
 
-			name := f.FileHeader.Name
-			outpath := path.Join(outdir, name)
-			os.MkdirAll(path.Dir(outpath), 0755)
+				if err := os.MkdirAll(path.Dir(outpath), 0755); err != nil {
+					println("Error creating parent directory:", err)
+					continue
+				}
 
-			workChan <- workItem{
-				file:    f,
-				outpath: outpath,
+				workChan <- workItem{
+					file:    f,
+					outpath: outpath,
+				}
 			}
 		}
 
@@ -85,10 +109,8 @@ func Unzip(files []string, outdir string, verbose bool) {
 		println("Queued:", file)
 	}
 
-	// Signal workers to stop
 	close(workChan)
 
-	// Wait for all workers to finish
 	wg.Wait()
 	println("All files extracted")
 }
