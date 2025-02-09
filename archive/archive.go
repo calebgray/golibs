@@ -5,10 +5,15 @@ import (
 	"io"
 	"os"
 	"path"
+	"runtime"
 	"sync"
 )
 
 func Unzip(files []string, outdir string, verbose bool) {
+	// Determine the number of available CPU threads
+	maxGoroutines := runtime.NumCPU()
+	sem := make(chan struct{}, maxGoroutines) // Semaphore to limit concurrency
+
 	for _, file := range files {
 		// Open Reader
 		r, err := zip.OpenReader(file)
@@ -27,15 +32,16 @@ func Unzip(files []string, outdir string, verbose bool) {
 
 			name := f.FileHeader.Name
 			outpath := path.Join(outdir, name)
-
 			os.MkdirAll(path.Dir(outpath), 0755)
 
 			wg.Add(1)
+			sem <- struct{}{} // Acquire a semaphore slot
 			go func(file *zip.File) {
 				defer wg.Done()
+				defer func() { <-sem }() // Release the semaphore slot
 
 				if verbose {
-					println("Extracting:", name)
+					println("Extracting:", file.Name)
 				}
 
 				// Open a Zip Entry
