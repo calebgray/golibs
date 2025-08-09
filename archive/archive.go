@@ -9,108 +9,75 @@ import (
 	"sync"
 )
 
-func Unzip(files []string, outdir string, verbose bool) {
-	// Create a channel for work items
-	type workItem struct {
-		file    *zip.File
-		outpath string
+func Unzip(zipFilename string, outDir string, verbose bool) {
+	// Open zip file once
+	zipReader, err := zip.OpenReader(zipFilename)
+	if err != nil {
+		os.Stderr.WriteString("Can't read zip (" + zipFilename + "):" + err.Error() + "\n")
+		return
 	}
-	workChan := make(chan workItem)
+	defer zipReader.Close()
 
-	// Create worker pool
-	var wg sync.WaitGroup
+	// Create a channel to distribute work
+	fileChan := make(chan *zip.File, len(zipReader.File))
+
+	// Queue all non-directory files for processing
+	for _, zipReaderFile := range zipReader.File {
+		// Create directories ahead of time
+		if zipReaderFile.Mode().IsDir() {
+			os.MkdirAll(path.Join(outDir, zipReaderFile.Name), 0755)
+			continue
+		}
+
+		// Make the parent directory
+		os.MkdirAll(path.Dir(path.Join(outDir, zipReaderFile.Name)), 0755)
+
+		// Queue work for each file
+		fileChan <- zipReaderFile
+	}
+	close(fileChan) // Close channel after all work is queued
+
+	// Thread per CPU to extract files from zip
 	numWorkers := runtime.NumCPU()
+	var wg sync.WaitGroup
 	wg.Add(numWorkers)
 
-	// Start workers
 	for i := 0; i < numWorkers; i++ {
 		go func() {
 			defer wg.Done()
-			for work := range workChan {
+
+			// Process files from the channel
+			for zipFile := range fileChan {
+				// Open the file in the zip for reading
+				rc, err := zipFile.Open()
+				if err != nil {
+					os.Stderr.WriteString("Can't read file (" + zipFile.Name + "):" + err.Error() + "\n")
+					continue
+				}
+				defer rc.Close()
+
+				// Determine the output filename
+				zipEntryFile := path.Join(outDir, zipFile.Name)
 				if verbose {
-					println("Extracting:", work.file.Name)
+					println(zipEntryFile)
 				}
 
-				// Open a Zip Entry
-				rc, err := work.file.Open()
-				if err != nil {
-					println("Can't open a zip entry:", err)
-					continue
-				}
+				// Create Destination File
+				if w, err := os.Create(zipEntryFile); err != nil {
+					os.Stderr.WriteString("Can't write file (" + zipEntryFile + "):" + err.Error() + "\n")
+				} else {
+					// Extract the File
+					if _, err := io.Copy(w, rc); err != nil {
+						os.Stderr.WriteString("Can't extract file (" + zipFile.Name + ") to (" + zipEntryFile + "): " + err.Error() + "\n")
+					}
 
-				// Create Destination File with temporary permissions
-				w, err := os.OpenFile(work.outpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-				if err != nil {
-					rc.Close()
-					println("Can't open a file to write:", err)
-					continue
-				}
-
-				// Extract the File
-				_, err = io.Copy(w, rc)
-
-				// Close handles before changing permissions
-				rc.Close()
-				w.Close()
-
-				if err != nil {
-					println("Error copying file:", err)
-					continue
-				}
-
-				// Get original permissions from zip
-				mode := work.file.Mode()
-
-				// If the file is marked as executable in the zip, ensure execute bits are set
-				if mode&0100 != 0 { // User executable
-					mode |= 0111 // Add execute bits for all
-				}
-
-				// Apply the permissions
-				if err := os.Chmod(work.outpath, mode); err != nil {
-					println("Error setting file permissions:", err)
+					// Clean up
+					w.Close()
 				}
 			}
 		}()
 	}
 
-	for _, file := range files {
-		r, err := zip.OpenReader(file)
-		if err != nil {
-			println("Can't open zip file:", err)
-			continue
-		}
-
-		for _, f := range r.File {
-			if f.Mode().IsDir() {
-				name := f.FileHeader.Name
-				outpath := path.Join(outdir, name)
-				if err := os.MkdirAll(outpath, f.Mode()); err != nil {
-					println("Error creating directory:", err)
-				}
-				continue
-			} else {
-				name := f.FileHeader.Name
-				outpath := path.Join(outdir, name)
-
-				if err := os.MkdirAll(path.Dir(outpath), 0755); err != nil {
-					println("Error creating parent directory:", err)
-					continue
-				}
-
-				workChan <- workItem{
-					file:    f,
-					outpath: outpath,
-				}
-			}
-		}
-
-		r.Close()
-		println("Queued:", file)
-	}
-
-	close(workChan)
-
+	// Wait for all workers to finish
 	wg.Wait()
-	println("All files extracted")
 }
